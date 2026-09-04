@@ -18,14 +18,12 @@ from starlette.requests import Request
 
 from app.audio import AudioError, decode_wav, encode_wav
 from app.limits import AudioStore, RateLimiter, client_ip
+from app.muse import CHUNK_MS, chunk_bytes, open_live_session, transcribe_with_muse
 from app.services import (
     LiveQuailProcessor,
     LiveTytoAnalyzer,
     analyze_with_tyto,
     enhance_with_quail,
-    gemini_client,
-    gemini_live_client,
-    transcribe_with_gemini,
 )
 
 
@@ -37,13 +35,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 MAX_UPLOAD_BYTES = 150 * 1024 * 1024
 comparison_slots = asyncio.Semaphore(2)
+# Room for ~5 s of 80 ms chunks per path, so a brief network stall is absorbed
+# and drained afterwards instead of stalling the browser reader.
+LIVE_QUEUE_CHUNKS = 64
 
 # Uploaded audio is never written to disk; it lives here only long enough for
 # the browser to play the A/B comparison back.
 audio_store = AudioStore()
 rate_limiter = RateLimiter()
 
-app = FastAPI(title="Gemini × Quail transcription lab")
+app = FastAPI(title="Muse Voice Transcribe × Quail transcription lab")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -77,12 +78,12 @@ def neutral_service_worker():
 
 @app.get("/api/status")
 def status():
-    google_api_key = bool(os.environ.get("GOOGLE_API_KEY"))
+    model_api_key = bool(os.environ.get("MODEL_API_KEY"))
     return {
-        "google": google_api_key,
-        "live": google_api_key,
+        "meta": model_api_key,
+        "live": model_api_key,
         "ai_coustics": bool(os.environ.get("AIC_SDK_LICENSE")),
-        "project": "API key" if google_api_key else "Not configured",
+        "credentials": "API key" if model_api_key else "Not configured",
     }
 
 
@@ -90,22 +91,29 @@ def _csv(value: str, limit: int) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()][:limit]
 
 
-def _public_google_error(exc: Exception) -> str:
+def _public_muse_error(exc: Exception) -> str:
     message = str(exc)
-    if "API key not valid" in message or "API_KEY_INVALID" in message:
+    if "kHz audio" in message or "not configured" in message:
+        return message  # already phrased for the client
+    if "401" in message or "Unauthorized" in message:
         return (
-            "GOOGLE_API_KEY is not a valid Gemini API key. "
-            "Create one at https://aistudio.google.com/apikey."
+            "MODEL_API_KEY is not a valid Meta Model API key. "
+            "Create one in the Model API dashboard at https://dev.meta.ai."
         )
-    if "NOT_FOUND" in message or "is not found for API version" in message:
+    if "429" in message or "rate_limit" in message:
+        return "Meta Model API rate limit or quota exceeded. Wait a moment and retry."
+    if "403" in message or "Forbidden" in message:
+        return "Meta denied access. Check that the API key can use Muse Voice Transcribe."
+    if "404" in message or "Not Found" in message:
         return (
-            "Gemini 3.5 Transcribe is not available to this API key. "
-            "Check the model name and that your key has access."
+            "The Muse transcription endpoint was not found. "
+            "Check MUSE_API_BASE; it should point at the /v1 root."
         )
-    if "RESOURCE_EXHAUSTED" in message or "429" in message:
-        return "Gemini rate limit or quota exceeded. Wait a moment and retry."
-    if "PERMISSION_DENIED" in message:
-        return "Google denied access. Check that the API key can use Gemini 3.5 Transcribe."
+    if "400" in message or "Bad Request" in message:
+        return (
+            "Muse rejected the session setup. Check MUSE_MODEL and that the audio "
+            "is 16 or 24 kHz mono."
+        )
     return "Live transcription failed. Check the server log for details."
 
 
@@ -116,22 +124,73 @@ def _pcm16(samples: np.ndarray) -> bytes:
 async def _receive_live_transcript(
     session: Any, websocket: WebSocket, path: str, send_lock: asyncio.Lock
 ) -> None:
-    async for message in session.receive():
-        server_content = getattr(message, "server_content", None)
-        if not server_content:
+    async for update in session.transcripts():
+        async with send_lock:
+            await websocket.send_json(
+                {
+                    "type": "transcript",
+                    "path": path,
+                    "final": update["final"],
+                    "text": update["text"],
+                    "speaker": update.get("speaker", ""),
+                }
+            )
+
+
+def _reraise_first_failure(*groups: list[asyncio.Task]) -> None:
+    """Surface a task's exception promptly instead of at the end of the session."""
+    for group in groups:
+        for task in group:
+            if task.done() and not task.cancelled() and task.exception() is not None:
+                raise task.exception()
+
+
+#: queued instead of a chunk to tell a sender the stream is finished
+END_OF_AUDIO = object()
+
+
+async def _forward_audio(
+    session: Any, queue: asyncio.Queue, chunk_size: int, tick_seconds: float
+) -> None:
+    """Feed one path's audio to Muse on the clock Muse itself is measuring.
+
+    Muse closes a session whose ingress falls behind real time, measured from
+    its own handshake. Two sessions open one after the other and neither can
+    send until the browser delivers, so a session is already in debt by the time
+    audio starts flowing, and a shortfall can never be repaid with audio that
+    has not been captured yet.
+
+    So the schedule is anchored on `session.started` and each pass sends
+    everything owed since then, substituting silence when the browser has not
+    delivered in time. That covers the handshake gap and any later stall, and
+    drains a backlog promptly so a bursty producer catches up.
+
+    Sending is decoupled from receiving for the same reason: a stall on one
+    socket must not hold up the other path or stop us reading from the browser.
+    """
+    silence = bytes(chunk_size)
+    sent = 0
+
+    while True:
+        due = int((time.monotonic() - session.started) / tick_seconds) + 1
+        while sent < due:
+            try:
+                chunk = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                chunk = silence
+            if chunk is END_OF_AUDIO:
+                return
+            await session.send_audio(chunk)
+            sent += 1
+
+        try:
+            chunk = await asyncio.wait_for(queue.get(), timeout=tick_seconds)
+        except TimeoutError:
             continue
-        interim = getattr(server_content, "interim_input_transcription", None)
-        if interim and getattr(interim, "text", None):
-            async with send_lock:
-                await websocket.send_json(
-                    {"type": "transcript", "path": path, "final": False, "text": interim.text}
-                )
-        final = getattr(server_content, "input_transcription", None)
-        if final and getattr(final, "text", None):
-            async with send_lock:
-                await websocket.send_json(
-                    {"type": "transcript", "path": path, "final": True, "text": final.text}
-                )
+        if chunk is END_OF_AUDIO:
+            return
+        await session.send_audio(chunk)
+        sent += 1
 
 
 async def _publish_live_tyto(
@@ -164,14 +223,14 @@ async def _run_tyto_only(
     websocket: WebSocket,
     tyto: LiveTytoAnalyzer,
     block_size: int,
-    google_error: Exception,
+    muse_error: Exception,
 ) -> None:
     send_lock = asyncio.Lock()
     stop = asyncio.Event()
     task = asyncio.create_task(_publish_live_tyto(tyto, websocket, send_lock, stop))
     try:
         await websocket.send_json(
-            {"type": "warning", "message": _public_google_error(google_error)}
+            {"type": "warning", "message": _public_muse_error(muse_error)}
         )
         await websocket.send_json(
             {
@@ -204,8 +263,6 @@ async def _run_tyto_only(
 
 @app.websocket("/ws/live")
 async def live_compare(websocket: WebSocket):
-    from google.genai import types
-
     await websocket.accept()
     refused = rate_limiter.check(
         client_ip(websocket.headers, websocket.client.host if websocket.client else None)
@@ -219,6 +276,7 @@ async def live_compare(websocket: WebSocket):
     tyto_task: asyncio.Task | None = None
     tyto_stop = asyncio.Event()
     receivers: list[asyncio.Task] = []
+    senders: list[asyncio.Task] = []
     try:
         options = await websocket.receive_json()
         sample_rate = int(options.get("sample_rate", 48_000))
@@ -238,28 +296,13 @@ async def live_compare(websocket: WebSocket):
             )
             if use_tyto:
                 tyto = await asyncio.to_thread(LiveTytoAnalyzer, sample_rate, block_size)
-            client = gemini_live_client()
-            transcription_options: dict[str, Any] = {}
-            languages = _csv(str(options.get("language_codes", "")), 20)
-            vocabulary = _csv(str(options.get("vocabulary", "")), 1_000)
-            if languages:
-                transcription_options["language_codes"] = languages
-            if vocabulary:
-                transcription_options["custom_vocabulary"] = vocabulary
-            config = types.LiveConnectConfig(
-                response_modalities=["TEXT"],
-                input_audio_transcription=types.AudioTranscriptionConfig(
-                    **transcription_options
-                ),
-            )
-            model = "gemini-3.5-transcribe-live"
+            language_bias = _csv(str(options.get("language_bias", "")), 20)
+            keywords = _csv(str(options.get("keywords", "")), 1_000)
             try:
                 async with (
-                    client.aio.live.connect(model=model, config=config) as raw_session,
-                    client.aio.live.connect(model=model, config=config) as enhanced_session,
+                    open_live_session(sample_rate, language_bias, keywords) as raw_session,
+                    open_live_session(sample_rate, language_bias, keywords) as enhanced_session,
                 ):
-                    if raw_session.setup_complete is None or enhanced_session.setup_complete is None:
-                        raise RuntimeError("Gemini Live session setup did not complete")
                     send_lock = asyncio.Lock()
                     receivers = [
                         asyncio.create_task(
@@ -269,6 +312,20 @@ async def live_compare(websocket: WebSocket):
                             _receive_live_transcript(
                                 enhanced_session, websocket, "enhanced", send_lock
                             )
+                        ),
+                    ]
+                    queues = {
+                        "raw": asyncio.Queue(maxsize=LIVE_QUEUE_CHUNKS),
+                        "enhanced": asyncio.Queue(maxsize=LIVE_QUEUE_CHUNKS),
+                    }
+                    chunk = chunk_bytes(sample_rate)
+                    tick = CHUNK_MS / 1000
+                    senders = [
+                        asyncio.create_task(
+                            _forward_audio(raw_session, queues["raw"], chunk, tick)
+                        ),
+                        asyncio.create_task(
+                            _forward_audio(enhanced_session, queues["enhanced"], chunk, tick)
                         ),
                     ]
                     if tyto is not None:
@@ -284,8 +341,10 @@ async def live_compare(websocket: WebSocket):
                             "transcription_available": True,
                         }
                     )
-                    mime_type = f"audio/pcm;rate={sample_rate}"
+                    pending = np.zeros(0, dtype=np.float32)
+                    outgoing = {"raw": bytearray(), "enhanced": bytearray()}
                     while True:
+                        _reraise_first_failure(receivers, senders)
                         incoming = await websocket.receive()
                         if incoming["type"] == "websocket.disconnect":
                             raise WebSocketDisconnect()
@@ -297,24 +356,28 @@ async def live_compare(websocket: WebSocket):
                         audio_bytes = incoming.get("bytes")
                         if not audio_bytes:
                             continue
-                        samples = np.frombuffer(audio_bytes, dtype="<f4")
-                        if len(samples) != block_size:
-                            continue
-                        if tyto is not None:
-                            tyto.buffer(samples)
-                        enhanced = processor.process(samples)
-                        await asyncio.gather(
-                            raw_session.send_realtime_input(
-                                audio=types.Blob(data=_pcm16(samples), mime_type=mime_type)
-                            ),
-                            enhanced_session.send_realtime_input(
-                                audio=types.Blob(data=_pcm16(enhanced), mime_type=mime_type)
-                            ),
+                        # Re-block rather than dropping odd-sized frames: Quail
+                        # needs its exact block size, but discarded audio reads
+                        # as ingress below real time and Muse hangs up.
+                        pending = np.concatenate(
+                            (pending, np.frombuffer(audio_bytes, dtype="<f4"))
                         )
-                    await asyncio.gather(
-                        raw_session.send_realtime_input(audio_stream_end=True),
-                        enhanced_session.send_realtime_input(audio_stream_end=True),
-                    )
+                        while len(pending) >= block_size:
+                            block, pending = pending[:block_size], pending[block_size:]
+                            if tyto is not None:
+                                tyto.buffer(block)
+                            outgoing["raw"] += _pcm16(block)
+                            outgoing["enhanced"] += _pcm16(processor.process(block))
+                        for path, buffered in outgoing.items():
+                            while len(buffered) >= chunk:
+                                await queues[path].put(bytes(buffered[:chunk]))
+                                del buffered[:chunk]
+                    for path, buffered in outgoing.items():
+                        if buffered:
+                            await queues[path].put(bytes(buffered))
+                        await queues[path].put(END_OF_AUDIO)
+                    await asyncio.gather(*senders)
+                    await asyncio.gather(raw_session.end_audio(), enhanced_session.end_audio())
                     tyto_stop.set()
                     if tyto_task is not None:
                         await asyncio.gather(tyto_task, return_exceptions=True)
@@ -328,14 +391,14 @@ async def live_compare(websocket: WebSocket):
             except Exception as exc:
                 if tyto is None or tyto_task is not None:
                     raise
-                print(f"Gemini unavailable, continuing with Tyto: {type(exc).__name__}: {exc}")
+                logger.warning("Muse unavailable, continuing with Tyto", exc_info=exc)
                 await _run_tyto_only(websocket, tyto, block_size, exc)
     except WebSocketDisconnect:
         pass
     except Exception as exc:
-        print(f"Live transcription error: {type(exc).__name__}: {exc}")
+        logger.exception("live transcription failed")
         try:
-            await websocket.send_json({"type": "error", "message": _public_google_error(exc)})
+            await websocket.send_json({"type": "error", "message": _public_muse_error(exc)})
         except Exception:
             pass
     finally:
@@ -343,9 +406,10 @@ async def live_compare(websocket: WebSocket):
         if tyto_task is not None and not tyto_task.done():
             tyto_task.cancel()
             await asyncio.gather(tyto_task, return_exceptions=True)
-        for task in receivers:
+        for task in (*receivers, *senders):
             if not task.done():
                 task.cancel()
+        await asyncio.gather(*receivers, *senders, return_exceptions=True)
         if processor is not None:
             try:
                 await asyncio.to_thread(processor.close)
@@ -374,10 +438,9 @@ async def compare(
     request: Request,
     audio_file: UploadFile = File(...),
     enhancement_level: float = Form(0.5),
-    language_codes: str = Form(""),
-    vocabulary: str = Form(""),
+    language_bias: str = Form(""),
+    keywords: str = Form(""),
     diarization: bool = Form(False),
-    word_timestamps: bool = Form(False),
     tyto: bool = Form(False),
 ):
     refused = rate_limiter.check(client_ip(request.headers, request.client.host if request.client else None))
@@ -403,13 +466,12 @@ async def compare(
             enhanced_wav = encode_wav(enhanced_audio)
 
             args = (
-                _csv(language_codes, 20),
-                _csv(vocabulary, 1_000),
+                _csv(language_bias, 20),
+                _csv(keywords, 1_000),
                 diarization,
-                word_timestamps,
             )
-            raw_task = asyncio.to_thread(transcribe_with_gemini, raw_audio, *args)
-            enhanced_task = asyncio.to_thread(transcribe_with_gemini, enhanced_audio, *args)
+            raw_task = asyncio.to_thread(transcribe_with_muse, raw_audio, *args)
+            enhanced_task = asyncio.to_thread(transcribe_with_muse, enhanced_audio, *args)
             if tyto:
                 raw_result, enhanced_result, tyto_result = await asyncio.gather(
                     raw_task, enhanced_task, asyncio.to_thread(analyze_with_tyto, raw_audio)
@@ -424,7 +486,7 @@ async def compare(
         elif isinstance(exc, TimeoutError):
             public_error = "Comparison timed out after 3 minutes"
         else:
-            public_error = _public_google_error(exc)
+            public_error = _public_muse_error(exc)
         raise HTTPException(502, public_error) from exc
 
     audio_store.put(job_id, {"original.wav": raw_wav, "quail.wav": enhanced_wav})

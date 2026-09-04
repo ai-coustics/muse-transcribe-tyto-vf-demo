@@ -1,6 +1,9 @@
-"""Modal deployment for the Gemini x Quail comparison demo.
+"""Modal deployment for the Muse Voice Transcribe x Quail comparison demo.
 
-    modal deploy modal_app.py
+    modal deploy modal_app.py -e aic-demos
+
+"aic-demos" is a Modal *environment*, not an app name; without -e this would
+deploy into Production.
 
 Modal has no built-in per-IP rate limiting, so limits live in app/limits.py.
 That limiter keeps per-process state, which is only accurate while a single
@@ -10,7 +13,7 @@ after moving the limiter to a modal.Dict.
 
 import modal
 
-app = modal.App("aic-demos")
+app = modal.App("muse-transcribe-tyto-vf-demo")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -20,11 +23,11 @@ image = (
 )
 
 # Create with:
-#   modal secret create aic-demo-secrets GOOGLE_API_KEY=... AIC_SDK_LICENSE=...
-secrets = [modal.Secret.from_name("aic-demo-secrets")]
+#   modal secret create muse-demo-secrets MODEL_API_KEY=... AIC_SDK_LICENSE=... -e aic-demos
+secrets = [modal.Secret.from_name("muse-demo-secrets")]
 
 # Quail and Tyto weights download on first use; a volume keeps them warm.
-models = modal.Volume.from_name("aic-demo-models", create_if_missing=True)
+models = modal.Volume.from_name("muse-demo-models", create_if_missing=True)
 
 
 @app.function(
@@ -38,7 +41,7 @@ models = modal.Volume.from_name("aic-demo-models", create_if_missing=True)
     timeout=900,
 )
 @modal.concurrent(max_inputs=8)  # websockets idle a lot; compare() gates real work
-@modal.asgi_app()
+@modal.asgi_app(label="muse-vf")  # URL: ...--muse-vf.modal.run
 def web():
     from app.main import app as fastapi_app
 

@@ -5,6 +5,9 @@ let recorder = null;
 let timerHandle = null;
 let activeListenPath = "raw";
 
+// Muse realtime accepts 16 or 24 kHz mono PCM; 24 kHz is the documented preference.
+const MUSE_LIVE_SAMPLE_RATE = 24000;
+
 // Tyto dimensions, per the ai-coustics docs. speaker_loudness is a level meter,
 // not a degradation score, so it is never coloured as a problem.
 const TYTO_DIMENSIONS = [
@@ -63,7 +66,7 @@ function renderTyto(tyto, windowLabel) {
 async function loadStatus() {
   try {
     const state = await fetch("/api/status").then((r) => r.json());
-    const ok = state.google && state.ai_coustics;
+    const ok = state.meta && state.ai_coustics;
     $("status").className = ok ? "status hidden" : "status missing";
     $("status").lastElementChild.textContent = "Credentials needed · see README";
   } catch {
@@ -83,6 +86,11 @@ function setFile(blob, name) {
 function clearFile() {
   selectedBlob = null; selectedName = ""; $("fileInput").value = "";
   $("selectedFile").classList.add("hidden"); $("runButton").disabled = true;
+}
+
+function speakerLabel(raw) {
+  const name = String(raw || "").replace(/^speaker[_\s-]*/i, "").trim();
+  return name ? `Speaker ${name}` : "";
 }
 
 function setLiveText(path, active) {
@@ -134,32 +142,38 @@ function resetLiveUi() {
 async function startLiveComparison() {
   $("errorBox").classList.add("hidden");
   const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
-  const context = new AudioContext(); await context.resume();
+  const context = new AudioContext({ sampleRate: MUSE_LIVE_SAMPLE_RATE }); await context.resume();
   const blockSize = Math.round(context.sampleRate * 0.015);
   const protocol = location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(`${protocol}://${location.host}/ws/live`);
-  const active = { socket, stream, context, blockSize, pending: new Float32Array(), processor: null, source: null, silent: null, finals: { raw: [], enhanced: [] }, interim: { raw: "", enhanced: "" }, started: null, cleaned: false };
+  const active = { socket, stream, context, blockSize, pending: new Float32Array(), processor: null, source: null, silent: null, finals: { raw: [], enhanced: [] }, interim: { raw: "", enhanced: "" }, lastSpeaker: { raw: "", enhanced: "" }, started: null, cleaned: false };
   recorder = active;
-  $("inputCard").classList.add("live-active"); $("recordButton").disabled = true; $("recordLabel").textContent = "Connecting"; $("recordHelp").textContent = "Loading Quail and Gemini Live";
-  $("results").classList.remove("hidden"); $("results").classList.add("live"); $("resultEyebrow").textContent = "Live comparison"; $("resultTitle").textContent = "Listening side by side"; $("rawTime").textContent = "Live"; $("enhancedTime").textContent = "Live"; $("rawModel").textContent = "Gemini 3.5 Transcribe Live";
+  $("inputCard").classList.add("live-active"); $("recordButton").disabled = true; $("recordLabel").textContent = "Connecting"; $("recordHelp").textContent = "Loading Quail and Muse";
+  $("results").classList.remove("hidden"); $("results").classList.add("live"); $("resultEyebrow").textContent = "Live comparison"; $("resultTitle").textContent = "Listening side by side"; $("rawTime").textContent = "Live"; $("enhancedTime").textContent = "Live"; $("rawModel").textContent = "Muse Voice Transcribe · live";
   setLiveText("raw", active); setLiveText("enhanced", active);
-  socket.addEventListener("open", () => socket.send(JSON.stringify({ sample_rate: context.sampleRate, block_size: blockSize, enhancement_level: Number($("enhancementLevel").value), language_codes: $("languages").value, vocabulary: $("vocabulary").value, tyto: $("tyto").checked })));
+  socket.addEventListener("open", () => socket.send(JSON.stringify({ sample_rate: context.sampleRate, block_size: blockSize, enhancement_level: Number($("enhancementLevel").value), language_bias: $("languages").value, keywords: $("vocabulary").value, tyto: $("tyto").checked })));
   socket.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
     if (message.type === "status") {
       $("recordHelp").textContent = message.text;
       if (message.status === "ready") {
         if (message.transcription_available === false) {
-          $("resultTitle").textContent = "Tyto live · Gemini blocked";
-          $("rawText").innerHTML = '<span class="empty">Gemini unavailable</span>';
-          $("enhancedText").innerHTML = '<span class="empty">Gemini unavailable</span>';
+          $("resultTitle").textContent = "Tyto live · Muse blocked";
+          $("rawText").innerHTML = '<span class="empty">Muse unavailable</span>';
+          $("enhancedText").innerHTML = '<span class="empty">Muse unavailable</span>';
         } else $("quailModel").textContent = `Quail VF 2.2 · ${message.quail_delay_ms}ms`;
         beginAudioCapture(active);
       }
     }
     if (message.type === "transcript") {
-      if (message.final) { active.finals[message.path].push(message.text); active.interim[message.path] = ""; }
-      else active.interim[message.path] = message.text;
+      if (message.final) {
+        // Muse diarizes the live stream too; label a turn only when the speaker changes.
+        const label = speakerLabel(message.speaker);
+        const prefix = label && label !== active.lastSpeaker[message.path] ? `${label}: ` : "";
+        active.lastSpeaker[message.path] = label;
+        active.finals[message.path].push(prefix + message.text);
+        active.interim[message.path] = "";
+      } else active.interim[message.path] = message.text;
       setLiveText(message.path, active);
     }
     if (message.type === "tyto") renderTyto(message, `live · ${message.window_seconds}s windows`);
@@ -203,12 +217,39 @@ function editDistance(a, b) {
   return prior[b.length];
 }
 function escapeHtml(value) { const div = document.createElement("div"); div.textContent = value; return div.innerHTML; }
+function turnTime(ms) {
+  if (ms == null) return "";
+  const total = Math.round(ms / 1000);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+// `common` holds the indices of words shared with the other path, counted over
+// the whole transcript, so the counter carries across turns.
+function diffWords(text, common, counter) {
+  return (text.match(/[\p{L}\p{N}'-]+|[^\p{L}\p{N}'-]+/gu) || [])
+    .map((token) => /[\p{L}\p{N}]/u.test(token)
+      ? `<span class="${common.has(counter.index++) ? "" : "changed"}">${escapeHtml(token)}</span>`
+      : escapeHtml(token))
+    .join("");
+}
+
 function renderTranscript(target, result, common = null) {
   if (!result.text) { target.innerHTML = '<span class="empty">No speech detected.</span>'; return; }
-  const labelled = result.segments.some((segment) => segment.speaker);
-  if (!common) { target.innerHTML = labelled ? result.segments.map((segment) => `<span class="speaker">${escapeHtml(segment.speaker || "Speaker")}</span>${escapeHtml(segment.text)}`).join("") : escapeHtml(result.text); return; }
-  let index = 0;
-  target.innerHTML = (result.text.match(/[\p{L}\p{N}'-]+|[^\p{L}\p{N}'-]+/gu) || []).map((token) => /[\p{L}\p{N}]/u.test(token) ? `<span class="${common.has(index++) ? "" : "changed"}">${escapeHtml(token)}</span>` : escapeHtml(token)).join("");
+  const segments = result.segments || [];
+  // Muse returns diarized turns, so label them even while diffing the two paths.
+  if (segments.some((segment) => segment.speaker)) {
+    const counter = { index: 0 };
+    const showTimes = $("timestamps").checked;
+    target.innerHTML = segments.map((segment) => {
+      const time = showTimes ? turnTime(segment.start_ms) : "";
+      const label = (speakerLabel(segment.speaker) || "Speaker") + (time ? ` \u00b7 ${time}` : "");
+      const body = common ? diffWords(segment.text, common, counter) : escapeHtml(segment.text);
+      return `<span class="speaker">${escapeHtml(label)}</span>${body}`;
+    }).join("");
+    return;
+  }
+  if (!common) { target.innerHTML = escapeHtml(result.text); return; }
+  target.innerHTML = diffWords(result.text, common, { index: 0 });
 }
 function showError(error) { $("errorText").textContent = error; $("errorBox").classList.remove("hidden"); }
 
@@ -218,8 +259,8 @@ async function runComparison() {
   const started = Date.now(); $("processingStep").textContent = "Enhancing audio, then transcribing both paths in parallel...";
   const clock = setInterval(() => { const sec = Math.floor((Date.now() - started) / 1000); $("processingTime").textContent = `${String(Math.floor(sec / 60)).padStart(2,"0")}:${String(sec % 60).padStart(2,"0")}`; }, 250);
   const form = new FormData();
-  form.append("audio_file", selectedBlob, selectedName); form.append("enhancement_level", $("enhancementLevel").value); form.append("language_codes", $("languages").value); form.append("vocabulary", $("vocabulary").value);
-  for (const id of ["diarization", "timestamps", "tyto"]) form.append(id === "timestamps" ? "word_timestamps" : id, $(id).checked ? "true" : "false");
+  form.append("audio_file", selectedBlob, selectedName); form.append("enhancement_level", $("enhancementLevel").value); form.append("language_bias", $("languages").value); form.append("keywords", $("vocabulary").value);
+  for (const id of ["diarization", "tyto"]) form.append(id, $(id).checked ? "true" : "false");
   try {
     const response = await fetch("/api/compare", { method: "POST", body: form });
     const data = await response.json(); if (!response.ok) throw new Error(data.detail || "Comparison failed");
@@ -234,7 +275,7 @@ async function runComparison() {
     $("similarity").textContent = maxWords ? `${Math.round(shared / maxWords * 100)}%` : "-";
     $("quailTime").textContent = `${data.quail.processing_ms}ms`; $("quailDelay").textContent = `${data.quail.audio_delay_ms}ms signal delay`;
     renderTyto(data.tyto, data.tyto ? `mean of ${data.tyto.windows} × ${data.tyto.window_seconds}s windows` : "");
-    $("results").classList.remove("hidden", "live"); $("rawModel").textContent = "Gemini 3.5 Transcribe"; $("resultEyebrow").textContent = "Result"; $("resultTitle").textContent = "Side by side"; $("results").scrollIntoView({ behavior:"smooth", block:"start" });
+    $("results").classList.remove("hidden", "live"); $("rawModel").textContent = "Muse Voice Transcribe"; $("resultEyebrow").textContent = "Result"; $("resultTitle").textContent = "Side by side"; $("results").scrollIntoView({ behavior:"smooth", block:"start" });
   } catch (error) { $("inputCard").classList.remove("hidden"); showError(error.message); }
   finally { clearInterval(clock); $("processing").classList.add("hidden"); }
 }
