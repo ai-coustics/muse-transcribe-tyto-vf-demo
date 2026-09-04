@@ -128,6 +128,13 @@ modal secret create muse-demo-secrets MODEL_API_KEY=... AIC_SDK_LICENSE=... -e a
 modal deploy modal_app.py -e aic-demos
 ```
 
+Live at <https://ai-coustics-aic-demos--muse-vf.modal.run>.
+
+`aic-demos` is a Modal *environment*, and `Production` is the active one, so `-e
+aic-demos` is not optional. This deploys as its own app,
+`muse-transcribe-tyto-vf-demo`, with its own secret and volume, so it sits
+alongside the Gemini demo rather than replacing it.
+
 `modal_app.py` pins `max_containers=1`. The rate limiter keeps per-process state, so it
 is only accurate while one container serves every request. If you raise that, move the
 limiter to a `modal.Dict` first or the limits become per-container.
